@@ -1,123 +1,62 @@
 # jdtls-go
 
-`jdtls-go` is one Go project with two programs:
+`jdtls-go` 是用 Go 编写的 Java 语言服务器和调试适配器，供支持 LSP/DAP 的编辑器使用。
 
-- `cmd/jdtls-go`: Java language server using LSP over stdio.
-- `cmd/java-debug-go`: Debug Adapter Protocol server using DAP over loopback TCP and a Go JDWP client.
+- `jdtls-go`：提供 Java 代码分析和 Maven classpath 解析。
+- `java-debug-go`：启动或连接 Java 程序，支持断点、单步、调用栈和变量查看。
 
-Both programs are implemented in Go 1.27. The debugger does not load a Java helper,
-the Microsoft `java-debug` JAR, Eclipse/OSGi bundles, or Gradle. The Java
-application being debugged still runs on a JDK; that is the target runtime,
-not an implementation dependency of these tools.
+项目仍在开发中，功能尚未完整替代 Eclipse JDT LS 或 Microsoft Java Debug。
 
-## Current implementation status
+## 构建
 
-The project is an early implementation, not yet feature-equivalent to
-Eclipse JDT LS or Microsoft's Java Debug Server. The current LSP slice includes
-stdio framing, document synchronization, recoverable Java parsing and syntax
-diagnostics, source type/member indexing, basic member completion, hover,
-definition, references, implementation/type-definition lookup, document and
-workspace symbols, signature help, Maven effective-model discovery, source
-attachment lookup, and Spring configuration metadata reading. Semantic
-resolution remains partial: overload selection, generic substitution, lexical
-scope rules, access control, full compiler diagnostics, and refactoring behavior
-are not implemented. Java syntax parsing uses
-the Tree-sitter Java grammar through Go bindings; the C grammar/runtime are
-compiled into the Go binaries, with no Java parser or server process. Maven support invokes Maven 3.9 (project
-`mvnw`, `MAVEN_HOME`, then `PATH`); `MAVEN_SETTINGS` selects a settings file.
-
-The DAP implementation now has a multiplexed JDWP reader for asynchronous VM
-events, source and function breakpoints, field data breakpoints, class-prepare
-handling, step over/into/out, thread and source stack frames, local-variable
-scopes, object/array expansion, exception breakpoints, and a limited expression
-evaluator for locals, primitive operators, fields, and arrays. It starts a target
-JVM with JDWP or attaches to an existing JDWP port. Java method invocation during
-evaluation, complete watchpoint semantics, run-in-terminal, hot code replace,
-and remaining upstream DAP features are still incomplete; this is not yet
-feature parity with Microsoft Java Debug.
-
-The LSP custom command `jdtls-go.startDebugSession` starts the sibling
-`java-debug-go` executable and returns its loopback `{host, port}` endpoint. Set
-`JAVA_DEBUG_GO` if the executable is not beside `jdtls-go` and is not on `PATH`.
-The editor must connect to that endpoint using DAP and send `launch` or
-`attach` requests.
-
-OpenIDEA compatibility includes the JDT LS `java/buildWorkspace` request and
-the `java.project.getClasspaths` / `vscode.java.startDebugSession` commands.
-The latter returns the numeric DAP port that OpenIDEA expects. Do not put the
-`java-debug-go` executable in OpenIDEA's JDT LS `bundles` list: `bundles` is for
-OSGi plugin JARs, while this Go debugger is started as a separate DAP process.
-Keep both Go executables beside each other or set `JAVA_DEBUG_GO` in the
-language-server process environment.
-
-## Build
-
-Use Go 1.27. From this directory, `make build` creates all four binaries in
-`bin/`. Build only the macOS arm64 or Windows amd64 pair with `make build-arm`
-or `make build-win`:
+需要 Go 1.27。编译结果写入 `bin/`：
 
 ```sh
-make build
-make build-arm
-make build-win
+make build      # macOS 和 Windows 两个平台
+make build-arm   # macOS Apple Silicon
+make build-win   # Windows x86_64，需要 MinGW-w64
 ```
 
-The targets are macOS arm64 and Windows amd64. Tree-sitter uses Cgo, so the
-Windows cross-build also needs an x86_64 MinGW-w64 C compiler. The Makefile
-defaults to `x86_64-w64-mingw32-gcc`; override it with `WINDOWS_CC` if your
-compiler has a different path. The aliases `make build-darwin-arm64` and
-`make build-windows-amd64` remain available.
+Maven 项目需要 Maven 3.9 和 JDK。构建 Windows 版本时，默认交叉编译器是
+`x86_64-w64-mingw32-gcc`，也可以通过 `WINDOWS_CC` 指定其他路径。
 
-To override the Go toolchain, set `GO`:
+## 在 OpenIDEA 中配置
 
-```sh
-make build GO=/path/to/go
+在 Java 项目的根目录创建 `.openidea/settings.toml`。将下面的 `/your/path/...`
+替换为你机器上的实际路径。示例用于 macOS Apple Silicon：
+
+```toml
+[languageServers.jdtls]
+command = "/your/path/jdtls-go/bin/jdtls-go-darwin-arm64"
+languages = ["java"]
+enabled = true
+
+[languageServers.jdtls.env]
+JAVA_DEBUG_GO = "/your/path/jdtls-go/bin/java-debug-go-darwin-arm64"
+MAVEN_HOME = "/your/path/apache-maven-3.9"
+MAVEN_SETTINGS = "/your/path/settings.xml"
+MAVEN_USER_PROPERTIES = "Dmaven.repo.local=/your/path/maven-repository"
+
+[languages.java]
+jdk = "/your/path/jdk-21"
+
+[languages.java.maven]
+userSettings = "/your/path/settings.xml"
 ```
 
-The Makefile prefers `/Users/Cage/bin/bin/go` when present and checks that the
-compiler is Go 1.27. The platform-specific binaries have suffixes so both
-targets can be kept in `bin/` at the same time. Start the macOS language server
-with `bin/jdtls-go-darwin-arm64` over stdio. Start its standalone debug adapter
-with `bin/java-debug-go-darwin-arm64 --listen 127.0.0.1:0`; it prints one JSON
-line with the selected endpoint. Keep the matching LSP and DAP executables
-together or set `JAVA_DEBUG_GO`.
+Windows 请将两个程序路径改为对应的 `.exe` 文件，例如
+`jdtls-go-windows-amd64.exe` 和 `java-debug-go-windows-amd64.exe`。
 
-## Maven classpath example
+`JAVA_DEBUG_GO` 指向独立的调试程序。**不要**把它填进 OpenIDEA 的
+`bundles`：`bundles` 用于 Eclipse/OSGi 插件 JAR，本项目的调试器不是 JAR。
 
-The language server exposes `jdtls-go.resolveClasspath` through
-`workspace/executeCommand`. It resolves compile scope by default and test scope
-when the second command argument is `true`. The result includes `target/classes`
-and Maven dependency entries, suitable for constructing a debug launch classpath.
+## 运行和调试
 
-The DAP `launch` request can also resolve a Maven runtime classpath itself. Pass
-`projectRoot`, optionally a `moduleDir` (absolute or relative to the reactor
-root), and the Java `mainClass`; omit `classPaths` to ask Maven 3.9 for the
-module's runtime dependencies. When `sourcePaths` is omitted, the adapter takes
-the module's main and test source roots from its POM. This also works for a
-Spring Boot application whose `mainClass` starts the application; the server
-does not need a Spring-specific launcher.
+在 OpenIDEA 中打开 Maven 项目，选择 Java 主类运行或调试。设置断点后，调试器会通过 Maven classpath 启动程序；也可以在 controller 中单步进入 service。
 
-Example DAP `launch` arguments for the JTps module:
+Maven 私有仓库和镜像配置放在 `settings.xml` 中。`MAVEN_SETTINGS` 和
+`userSettings` 应指向同一个文件；`MAVEN_USER_PROPERTIES` 可指定本地依赖目录。
 
-```json
-{
-  "projectRoot": "/Users/Cage/snac21/java-server/jtps",
-  "moduleDir": "jtps",
-  "mainClass": "com.example.jtps.JtpsApplication"
-}
-```
+## 当前范围
 
-If the reactor root is itself the application module, set `moduleDir` to `.`.
-The target JVM still needs a JDK and the module must have been compiled (for
-example, with `mvn -f jtps/pom.xml compile`). Maven settings and project
-profiles can be selected with `MAVEN_SETTINGS`, `MAVEN_PROFILES`,
-`MAVEN_OFFLINE=true`, and `MAVEN_USER_PROPERTIES` (space-separated `key=value`
-entries). The LSP command `jdtls-go.resolveEffectiveModel` returns the
-interpolated module model; `jdtls-go.resolveSources` resolves dependency sources
-and enables navigation into attached source JARs. Its `attachments` result maps
-binary JAR paths to source JAR paths; pass that map as `sourceAttachments` in a
-DAP `launch` request to enable dependency source lookup in stack frames.
-
-See [docs/protocol-parity.md](docs/protocol-parity.md) for the current local
-upstream LSP/DAP coverage matrix. The listed partial and unsupported features
-are material gaps; a successful build is not feature parity.
+项目支持基础 Java 分析、Maven classpath 解析和常用源码调试功能。完整编译器语义、重构、表达式求值以及 Eclipse/Microsoft 调试器的全部功能仍未实现。
