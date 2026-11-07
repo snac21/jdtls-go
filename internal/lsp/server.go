@@ -1097,18 +1097,28 @@ func (s *server) execute(raw json.RawMessage) (any, error) {
 	case "vscode.java.updateDebugSettings":
 		return map[string]any{"updated": true}, nil
 	case "vscode.java.resolveClasspath":
-		module := "."
-		scope := false
+		inputPath := ""
 		if len(p.Arguments) > 0 {
 			var arg0 any
 			_ = json.Unmarshal(p.Arguments[0], &arg0)
 			if str, ok := arg0.(string); ok {
-				module = str
+				inputPath = str
 			}
+		}
+		module, err := s.moduleForPath(inputPath)
+		if err != nil {
+			module = s.root
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		defer cancel()
-		return maven.ResolveClasspath(ctx, s.root, module, scope)
+		classpath, err := maven.ResolveRuntimeClasspath(ctx, s.root, module)
+		if err != nil {
+			classpath, err = maven.ResolveClasspath(ctx, s.root, module, false)
+		}
+		if err != nil || len(classpath.Entries) == 0 {
+			return []string{filepath.Join(module, "target", "classes")}, nil
+		}
+		return classpath.Entries, nil
 	case "java.project.updateClassPaths":
 		return map[string]any{"updated": true}, nil
 	case "java.project.upgradeGradle":
@@ -1133,6 +1143,19 @@ func (s *server) moduleForPath(value string) (string, error) {
 	if value == "" {
 		return root, nil
 	}
+	// 尝试反查传入的全限定主类名 (如 com.example.jtps.JtpsApplication)
+	if strings.Contains(value, ".") && !filepath.IsAbs(value) && !strings.Contains(value, "/") && !strings.Contains(value, "\\") {
+		s.mu.RLock()
+		for uri, u := range s.units {
+			for _, t := range u.Types {
+				if t.QualifiedName == value {
+					value = uriPath(uri)
+					break
+				}
+			}
+		}
+		s.mu.RUnlock()
+	}
 	path := uriPath(value)
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(root, path)
@@ -1156,7 +1179,10 @@ func (s *server) moduleForPath(value string) (string, error) {
 		}
 	}
 	if selected == "" {
-		return "", fmt.Errorf("no Maven module contains %s", path)
+		if len(modules) > 0 {
+			return modules[0].Dir, nil
+		}
+		return root, nil
 	}
 	return selected, nil
 }
@@ -1340,14 +1366,43 @@ func (s *server) stopDebugSession() {
 
 func (s *server) document(uri string) string {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.documents[uri]
+	doc, ok := s.documents[uri]
+	s.mu.RUnlock()
+	if ok {
+		return doc
+	}
+	path := uriPath(uri)
+	if data, err := os.ReadFile(path); err == nil {
+		text := string(data)
+		s.mu.Lock()
+		s.documents[uri] = text
+		s.mu.Unlock()
+		s.parseDocument(uri, text)
+		return text
+	}
+	return ""
 }
 
 func (s *server) unit(uri string) javaparser.Unit {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.units[uri]
+	u, ok := s.units[uri]
+	s.mu.RUnlock()
+	if ok && (len(u.Types) > 0 || len(u.Symbols) > 0 || u.Package != "") {
+		return u
+	}
+	path := uriPath(uri)
+	if data, err := os.ReadFile(path); err == nil {
+		text := string(data)
+		s.mu.Lock()
+		s.documents[uri] = text
+		s.mu.Unlock()
+		s.parseDocument(uri, text)
+		s.mu.RLock()
+		u = s.units[uri]
+		s.mu.RUnlock()
+		return u
+	}
+	return u
 }
 
 func (s *server) parseDocument(uri, text string) {
@@ -1954,6 +2009,17 @@ func (s *server) definition(raw json.RawMessage) any {
 			}
 		}
 	}
+	if len(locations) == 0 {
+		for uri, sourceUnit := range s.units {
+			for _, typeInfo := range sourceUnit.Types {
+				for _, declared := range typeInfo.Members {
+					if declared.Name == identifier.Name {
+						locations = append(locations, map[string]any{"uri": uri, "range": lspRange(declared.Selection)})
+					}
+				}
+			}
+		}
+	}
 	return locations
 }
 
@@ -2076,29 +2142,67 @@ func (s *server) implementation(raw json.RawMessage) []map[string]any {
 	}
 	_ = json.Unmarshal(raw, &params)
 	identifier, ok := s.identifierNodeAt(params.TextDocument.URI, params.Position)
-	if !ok || identifier.Kind != "type_identifier" {
+	if !ok {
 		return []map[string]any{}
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	unit := s.units[params.TextDocument.URI]
-	target, ok := resolveSemanticType(s.units, s.typeIndex, unit, identifier.Name)
-	if !ok {
-		return []map[string]any{}
-	}
 	items := make([]map[string]any, 0)
+
+	if identifier.Kind == "type_identifier" {
+		target, ok := resolveSemanticType(s.units, s.typeIndex, unit, identifier.Name)
+		if !ok {
+			return []map[string]any{}
+		}
+		for uri, sourceUnit := range s.units {
+			for _, candidate := range sourceUnit.Types {
+				parents := append([]string{candidate.Super}, candidate.Interfaces...)
+				for _, parent := range parents {
+					resolved, found := resolveSemanticType(s.units, s.typeIndex, sourceUnit, parent)
+					if found && resolved.Name == target.Name {
+						items = append(items, map[string]any{"uri": uri, "range": lspRange(candidate.Selection)})
+						break
+					}
+				}
+			}
+		}
+		return items
+	}
+
+	// 用户点击方法/字段跳转实现：在继承类或实现类中查找同名成员
+	current := sourceTypeAt(unit, params.Position)
 	for uri, sourceUnit := range s.units {
 		for _, candidate := range sourceUnit.Types {
-			parents := append([]string{candidate.Super}, candidate.Interfaces...)
-			for _, parent := range parents {
-				resolved, found := resolveSemanticType(s.units, s.typeIndex, sourceUnit, parent)
-				if found && resolved.Name == target.Name {
-					items = append(items, map[string]any{"uri": uri, "range": lspRange(candidate.Selection)})
-					break
+			isSubtype := false
+			if current != nil {
+				for _, parent := range append([]string{candidate.Super}, candidate.Interfaces...) {
+					if parent == current.Name || parent == current.QualifiedName {
+						isSubtype = true
+						break
+					}
+				}
+			}
+			for _, m := range candidate.Members {
+				if m.Name == identifier.Name && (isSubtype || current == nil || candidate.QualifiedName != current.QualifiedName) {
+					items = append(items, map[string]any{"uri": uri, "range": lspRange(m.Selection)})
 				}
 			}
 		}
 	}
+
+	if len(items) == 0 {
+		for uri, sourceUnit := range s.units {
+			for _, candidate := range sourceUnit.Types {
+				for _, m := range candidate.Members {
+					if m.Name == identifier.Name {
+						items = append(items, map[string]any{"uri": uri, "range": lspRange(m.Selection)})
+					}
+				}
+			}
+		}
+	}
+
 	return items
 }
 

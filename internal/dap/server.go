@@ -37,6 +37,7 @@ type server struct {
 	logger            *log.Logger
 	seq               int
 	mu                sync.Mutex
+	pendingStart      *request
 	vm                *jdwp.Connection
 	process           *exec.Cmd
 	launched          bool
@@ -119,7 +120,7 @@ func Serve(input io.Reader, output io.Writer, logger *log.Logger) error {
 func (s *server) dispatch(req request) error {
 	switch req.Command {
 	case "initialize":
-		if err := s.response(req, true, map[string]any{
+		return s.response(req, true, map[string]any{
 			"supportsConfigurationDoneRequest":   true,
 			"supportsTerminateRequest":           true,
 			"supportsPauseRequest":               true,
@@ -138,23 +139,36 @@ func (s *server) dispatch(req request) error {
 			"supportsRestartFrame":               true,
 			"supportsInlineValues":               true,
 			"supportsRedefineClasses":            true,
-		}); err != nil {
-			return err
-		}
-		return s.event("initialized", map[string]any{})
+		})
 	case "launch":
+		if s.pendingStart != nil {
+			return errors.New("a launch or attach request is already awaiting configurationDone")
+		}
 		if err := s.launch(req.Arguments); err != nil {
 			return err
 		}
-		if err := s.response(req, true, map[string]any{}); err != nil {
+		s.pendingStart = &req
+		if err := s.event("process", map[string]any{"name": "Java", "isLocalProcess": true, "startMethod": "launch"}); err != nil {
 			return err
 		}
-		return s.event("process", map[string]any{"name": "Java", "isLocalProcess": true, "startMethod": "launch"})
+		if err := s.event("initialized", map[string]any{}); err != nil {
+			return err
+		}
+		s.trace("launch connected to JDWP; waiting for IDE breakpoint configuration")
+		return nil
 	case "attach":
+		if s.pendingStart != nil {
+			return errors.New("a launch or attach request is already awaiting configurationDone")
+		}
 		if err := s.attach(req.Arguments); err != nil {
 			return err
 		}
-		return s.response(req, true, map[string]any{})
+		s.pendingStart = &req
+		if err := s.event("initialized", map[string]any{}); err != nil {
+			return err
+		}
+		s.trace("attach connected to JDWP; waiting for IDE breakpoint configuration")
+		return nil
 	case "configurationDone":
 		if s.vm != nil && !s.launched {
 			s.setStopped(false)
@@ -163,7 +177,15 @@ func (s *server) dispatch(req request) error {
 			}
 			s.launched = true
 		}
-		return s.response(req, true, map[string]any{})
+		if err := s.response(req, true, map[string]any{}); err != nil {
+			return err
+		}
+		if s.pendingStart != nil {
+			start := *s.pendingStart
+			s.pendingStart = nil
+			return s.response(start, true, map[string]any{})
+		}
+		return nil
 	case "threads":
 		if s.vm == nil {
 			return errors.New("no JVM is attached")
@@ -183,6 +205,7 @@ func (s *server) dispatch(req request) error {
 		if s.vm == nil {
 			return errors.New("no JVM is attached")
 		}
+		s.trace("IDE requested continue; resuming JVM")
 		if s.stepRequest != 0 {
 			_ = s.vm.ClearEvent(jdwp.EventSingleStep, s.stepRequest)
 			s.stepRequest = 0
@@ -414,76 +437,231 @@ func (s *server) dispatch(req request) error {
 	}
 }
 
-func (s *server) launch(raw json.RawMessage) error {
-	var args struct {
-		JavaExec          string            `json:"javaExec"`
-		MainClass         string            `json:"mainClass"`
-		ClassPaths        []string          `json:"classPaths"`
-		ProjectRoot       string            `json:"projectRoot"`
-		ModuleDir         string            `json:"moduleDir"`
-		VMArgs            []string          `json:"vmArgs"`
-		ProgramArgs       []string          `json:"args"`
-		CWD               string            `json:"cwd"`
-		Env               map[string]string `json:"env"`
-		SourcePaths       []string          `json:"sourcePaths"`
-		SourceAttachments map[string]string `json:"sourceAttachments"`
+func parseStringOrSlice(val any) []string {
+	if val == nil {
+		return nil
 	}
-	if err := json.Unmarshal(raw, &args); err != nil {
+	switch v := val.(type) {
+	case string:
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return nil
+		}
+		return splitCommandLine(v)
+	case []string:
+		return v
+	case []any:
+		res := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				res = append(res, s)
+			}
+		}
+		return res
+	}
+	return nil
+}
+
+func splitCommandLine(cmd string) []string {
+	var args []string
+	var current strings.Builder
+	inQuote := false
+	quoteChar := byte(0)
+	escaped := false
+
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		if escaped {
+			current.WriteByte(c)
+			escaped = false
+			continue
+		}
+		if c == '\\' {
+			escaped = true
+			continue
+		}
+		if inQuote {
+			if c == quoteChar {
+				inQuote = false
+			} else {
+				current.WriteByte(c)
+			}
+			continue
+		}
+		if c == '"' || c == '\'' {
+			inQuote = true
+			quoteChar = c
+			continue
+		}
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			if current.Len() > 0 {
+				args = append(args, current.String())
+				current.Reset()
+			}
+			continue
+		}
+		current.WriteByte(c)
+	}
+	if current.Len() > 0 {
+		args = append(args, current.String())
+	}
+	return args
+}
+
+func (s *server) launch(raw json.RawMessage) error {
+	var rawMap map[string]any
+	if err := json.Unmarshal(raw, &rawMap); err != nil {
 		return err
 	}
-	if args.MainClass == "" {
+
+	mainClass := ""
+	for _, k := range []string{"mainClass", "MainClass"} {
+		if v, ok := rawMap[k].(string); ok && v != "" {
+			mainClass = v
+			break
+		}
+	}
+	if mainClass == "" {
 		return errors.New("launch requires mainClass")
 	}
-	if len(args.ClassPaths) == 0 && args.ProjectRoot != "" {
-		moduleDir := args.ModuleDir
-		if moduleDir == "" {
-			var err error
-			moduleDir, err = filepath.Abs(args.ProjectRoot)
-			if err != nil {
-				return err
+
+	javaExec := ""
+	if v, ok := rawMap["javaExec"].(string); ok && v != "" {
+		javaExec = v
+	}
+
+	cwd := ""
+	if v, ok := rawMap["cwd"].(string); ok && v != "" {
+		cwd = v
+	}
+
+	projectRoot := ""
+	if v, ok := rawMap["projectRoot"].(string); ok && v != "" {
+		projectRoot = v
+	} else if cwd != "" {
+		projectRoot = cwd
+	} else if w, err := os.Getwd(); err == nil {
+		projectRoot = w
+	}
+
+	moduleDir := ""
+	if v, ok := rawMap["moduleDir"].(string); ok && v != "" {
+		moduleDir = v
+	} else {
+		moduleDir = projectRoot
+	}
+
+	var classPaths []string
+	for _, k := range []string{"classPaths", "classpath", "classpaths", "ClassPaths"} {
+		if v, ok := rawMap[k]; ok {
+			if sl, ok := v.([]any); ok {
+				for _, item := range sl {
+					if str, ok := item.(string); ok && str != "" {
+						classPaths = append(classPaths, str)
+					}
+				}
+				if len(classPaths) > 0 {
+					break
+				}
+			} else if sl, ok := v.([]string); ok {
+				classPaths = sl
+				if len(classPaths) > 0 {
+					break
+				}
+			} else if str, ok := v.(string); ok && str != "" {
+				classPaths = append(classPaths, strings.Split(str, string(os.PathListSeparator))...)
+				if len(classPaths) > 0 {
+					break
+				}
 			}
 		}
+	}
+
+	vmArgs := parseStringOrSlice(rawMap["vmArgs"])
+	if len(vmArgs) == 0 {
+		vmArgs = parseStringOrSlice(rawMap["vmArguments"])
+	}
+
+	programArgs := parseStringOrSlice(rawMap["args"])
+	if len(programArgs) == 0 {
+		programArgs = parseStringOrSlice(rawMap["programArgs"])
+	}
+
+	sourcePaths := parseStringOrSlice(rawMap["sourcePaths"])
+
+	envMap := map[string]string{}
+	if envRaw, ok := rawMap["env"].(map[string]any); ok {
+		for k, v := range envRaw {
+			if s, ok := v.(string); ok {
+				envMap[k] = s
+			} else {
+				envMap[k] = fmt.Sprint(v)
+			}
+		}
+	}
+
+	if len(classPaths) == 0 && projectRoot != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-		classpath, err := maven.ResolveRuntimeClasspath(ctx, args.ProjectRoot, moduleDir)
+		classpath, err := maven.ResolveRuntimeClasspath(ctx, projectRoot, moduleDir)
 		cancel()
-		if err != nil {
-			return fmt.Errorf("resolve Maven runtime classpath: %w", err)
-		}
-		args.ClassPaths = classpath.Entries
-	}
-	if len(args.SourcePaths) == 0 && args.ProjectRoot != "" {
-		modules, err := maven.Discover(args.ProjectRoot)
-		if err != nil {
-			return fmt.Errorf("discover Maven source roots: %w", err)
-		}
-		moduleDir := args.ModuleDir
-		if moduleDir == "" {
-			moduleDir, err = filepath.Abs(args.ProjectRoot)
-			if err != nil {
-				return err
+		if err == nil && len(classpath.Entries) > 0 {
+			classPaths = classpath.Entries
+		} else {
+			// 保底寻找 target/classes
+			targetDir := filepath.Join(moduleDir, "target", "classes")
+			if _, statErr := os.Stat(targetDir); statErr == nil {
+				classPaths = []string{targetDir}
+			} else if err != nil {
+				return fmt.Errorf("resolve Maven runtime classpath: %w", err)
 			}
 		}
-		if !filepath.IsAbs(moduleDir) {
-			moduleDir = filepath.Join(args.ProjectRoot, moduleDir)
-		}
-		moduleDir, err = filepath.Abs(moduleDir)
-		if err != nil {
-			return err
-		}
-		for _, module := range modules {
-			if module.Dir == moduleDir {
-				args.SourcePaths = append(args.SourcePaths, module.SourceRoots...)
-				args.SourcePaths = append(args.SourcePaths, module.TestSourceRoots...)
+	}
+
+	if len(sourcePaths) == 0 && projectRoot != "" {
+		modules, err := maven.Discover(projectRoot)
+		if err == nil {
+			targetMod := moduleDir
+			if !filepath.IsAbs(targetMod) {
+				targetMod = filepath.Join(projectRoot, targetMod)
+			}
+			targetMod, _ = filepath.Abs(targetMod)
+			for _, m := range modules {
+				if m.Dir == targetMod || m.Dir == projectRoot {
+					sourcePaths = append(sourcePaths, m.SourceRoots...)
+					sourcePaths = append(sourcePaths, m.TestSourceRoots...)
+				}
 			}
 		}
-		if len(args.SourcePaths) == 0 {
-			return fmt.Errorf("Maven module %s has no discovered Java source roots", moduleDir)
+		if len(sourcePaths) == 0 {
+			for _, cp := range classPaths {
+				if strings.HasSuffix(filepath.ToSlash(cp), "/target/classes") {
+					baseDir := filepath.Dir(filepath.Dir(cp))
+					srcMain := filepath.Join(baseDir, "src", "main", "java")
+					if fi, statErr := os.Stat(srcMain); statErr == nil && fi.IsDir() {
+						sourcePaths = append(sourcePaths, srcMain)
+					}
+					srcTest := filepath.Join(baseDir, "src", "test", "java")
+					if fi, statErr := os.Stat(srcTest); statErr == nil && fi.IsDir() {
+						sourcePaths = append(sourcePaths, srcTest)
+					}
+				}
+			}
 		}
 	}
-	java := args.JavaExec
+
+	java := javaExec
 	if java == "" {
-		java = "java"
+		if jh := os.Getenv("JAVA_HOME"); jh != "" {
+			cand := filepath.Join(jh, "bin", "java")
+			if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
+				java = cand
+			}
+		}
+		if java == "" {
+			java = "java"
+		}
 	}
+
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return err
@@ -491,31 +669,35 @@ func (s *server) launch(raw json.RawMessage) error {
 	port := listener.Addr().(*net.TCPAddr).Port
 	_ = listener.Close()
 	commandArgs := []string{"-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:" + strconv.Itoa(port)}
-	commandArgs = append(commandArgs, args.VMArgs...)
-	if len(args.ClassPaths) > 0 {
-		commandArgs = append(commandArgs, "-cp", strings.Join(args.ClassPaths, string(os.PathListSeparator)))
+	commandArgs = append(commandArgs, vmArgs...)
+	if len(classPaths) > 0 {
+		commandArgs = append(commandArgs, "-cp", strings.Join(classPaths, string(os.PathListSeparator)))
 	}
-	commandArgs = append(commandArgs, args.MainClass)
-	commandArgs = append(commandArgs, args.ProgramArgs...)
+	commandArgs = append(commandArgs, mainClass)
+	commandArgs = append(commandArgs, programArgs...)
 	cmd := exec.Command(java, commandArgs...)
-	if args.CWD != "" {
-		cmd.Dir = args.CWD
-	} else if args.ModuleDir != "" {
-		cmd.Dir = args.ModuleDir
-		if !filepath.IsAbs(cmd.Dir) && args.ProjectRoot != "" {
-			cmd.Dir = filepath.Join(args.ProjectRoot, cmd.Dir)
+	if cwd != "" {
+		cmd.Dir = cwd
+	} else if moduleDir != "" {
+		cmd.Dir = moduleDir
+		if !filepath.IsAbs(cmd.Dir) && projectRoot != "" {
+			cmd.Dir = filepath.Join(projectRoot, cmd.Dir)
 		}
-	} else if args.ProjectRoot != "" {
-		cmd.Dir = args.ProjectRoot
+	} else if projectRoot != "" {
+		cmd.Dir = projectRoot
 	}
-	if len(args.Env) > 0 {
+	if len(envMap) > 0 {
 		env := os.Environ()
-		for k, v := range args.Env {
+		for k, v := range envMap {
 			env = append(env, k+"="+v)
 		}
 		cmd.Env = env
 	}
 	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
 	}
@@ -528,13 +710,28 @@ func (s *server) launch(raw json.RawMessage) error {
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
 			line := scanner.Text()
-			s.logger.Printf("target JVM: %s", line)
+			s.logger.Printf("target JVM stderr: %s", line)
 			if strings.Contains(line, "Listening for transport dt_socket") {
 				select {
 				case ready <- struct{}{}:
 				default:
 				}
 			}
+			_ = s.event("output", map[string]any{"category": "stderr", "output": line + "\n"})
+		}
+	}()
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			line := scanner.Text()
+			s.logger.Printf("target JVM stdout: %s", line)
+			if strings.Contains(line, "Listening for transport dt_socket") {
+				select {
+				case ready <- struct{}{}:
+				default:
+				}
+			}
+			_ = s.event("output", map[string]any{"category": "stdout", "output": line + "\n"})
 		}
 	}()
 	select {
@@ -549,9 +746,13 @@ func (s *server) launch(raw json.RawMessage) error {
 		return fmt.Errorf("attach JDWP: %w", err)
 	}
 	s.vm = vm
-	s.sourceRoots = args.SourcePaths
-	for binary, source := range args.SourceAttachments {
-		s.sourceAttachments[filepath.Clean(binary)] = source
+	s.sourceRoots = sourcePaths
+	if saRaw, ok := rawMap["sourceAttachments"].(map[string]any); ok {
+		for binary, source := range saRaw {
+			if sStr, ok := source.(string); ok {
+				s.sourceAttachments[filepath.Clean(binary)] = sStr
+			}
+		}
 	}
 	return s.startMonitoring()
 }
@@ -604,6 +805,7 @@ func (s *server) monitorEvents() {
 			s.setLastException(jdwp.Event{})
 			s.handleBreakpointEvent(event)
 		case jdwp.EventSingleStep:
+			s.trace("JDWP single-step event request=%d thread=%d class=%d method=%d codeIndex=%d", event.RequestID, event.ThreadID, event.Location.ClassID, event.Location.MethodID, event.Location.Index)
 			s.setLastException(jdwp.Event{})
 			_ = s.vm.ClearEvent(jdwp.EventSingleStep, event.RequestID)
 			s.stepRequest = 0
@@ -646,6 +848,11 @@ func (s *server) setBreakpoints(req request) error {
 		return err
 	}
 	source := normalizeSourcePath(args.Source.Path)
+	requestedLines := make([]int, 0, len(args.Breakpoints))
+	for _, breakpoint := range args.Breakpoints {
+		requestedLines = append(requestedLines, breakpoint.Line)
+	}
+	s.trace("setBreakpoints source=%q lines=%v", source, requestedLines)
 	s.bpMu.Lock()
 	for _, old := range s.bps[source] {
 		for _, requestID := range old.Locations {
@@ -665,12 +872,23 @@ func (s *server) setBreakpoints(req request) error {
 	if err != nil {
 		return err
 	}
+	s.trace("setBreakpoints found %d loaded classes for source=%q", len(classes), source)
 	for _, class := range classes {
 		s.resolveClassBreakpoints(class.ID, class.Signature)
 	}
 	items := make([]map[string]any, 0, len(requested))
 	for _, breakpoint := range requested {
-		item := map[string]any{"id": breakpoint.ID, "verified": breakpoint.Verified, "line": breakpoint.ActualLine}
+		line := breakpoint.Line
+		if breakpoint.Verified && breakpoint.ActualLine > 0 {
+			line = breakpoint.ActualLine
+		}
+		item := map[string]any{
+			"id":       breakpoint.ID,
+			"verified": breakpoint.Verified,
+			"line":     line,
+			"source":   map[string]any{"name": filepath.Base(source), "path": source},
+		}
+		s.trace("breakpoint id=%d requestedLine=%d verified=%t actualLine=%d locations=%d", breakpoint.ID, breakpoint.Line, breakpoint.Verified, breakpoint.ActualLine, len(breakpoint.Locations))
 		if !breakpoint.Verified {
 			if breakpoint.Condition != "" || breakpoint.LogMessage != "" || breakpoint.HitCondition != "" {
 				item["message"] = "source class is not loaded or the line has no executable code"
@@ -811,14 +1029,21 @@ func (s *server) resolveClassBreakpoints(classID uint64, signature string) {
 	}
 	sourceName, err := s.vm.SourceFile(classID)
 	if err != nil {
+		s.trace("could not read SourceFile for class=%d signature=%q: %v", classID, signature, err)
 		return
 	}
 	classPath := filepath.ToSlash(filepath.Join(packagePath, sourceName))
+	matched := false
 	for _, source := range sources {
 		if !strings.HasSuffix(filepath.ToSlash(source), classPath) {
 			continue
 		}
+		matched = true
+		s.trace("matched source=%q to class=%q SourceFile=%q", source, signature, sourceName)
 		s.installForClass(source, classID)
+	}
+	if !matched {
+		s.trace("source path did not match prepared class=%q SourceFile=%q candidatePath=%q requestedSources=%q", signature, sourceName, classPath, sources)
 	}
 }
 
@@ -962,6 +1187,7 @@ func (s *server) exceptionInfo(req request) error {
 func (s *server) installForClass(source string, classID uint64) {
 	methods, err := s.vm.Methods(classID)
 	if err != nil {
+		s.trace("breakpoint resolution: list methods for source=%q class=%d: %v", source, classID, err)
 		return
 	}
 	type candidate struct {
@@ -1000,12 +1226,28 @@ func (s *server) installForClass(source string, classID uint64) {
 				s.byJDWP[requestID] = breakpoint
 				breakpoint.Verified = true
 				breakpoint.ActualLine = match.line
+				s.trace("installed breakpoint id=%d source=%q requestedLine=%d actualLine=%d class=%d method=%d codeIndex=%d request=%d", breakpoint.ID, source, breakpoint.Line, match.line, classID, match.method, match.code, requestID)
+			} else {
+				s.trace("failed to install breakpoint source=%q requestedLine=%d class=%d method=%d codeIndex=%d: %v", source, breakpoint.Line, classID, match.method, match.code, setErr)
 			}
+		}
+		if len(matches) == 0 {
+			s.trace("found no executable line at or after %d in source=%q class=%d", breakpoint.Line, source, classID)
 		}
 		if len(matches) > 0 && breakpoint.Verified {
 			breakpoint.Resolved[classID] = true
 			if !wasVerified {
-				s.event("breakpoint", map[string]any{"reason": "changed", "breakpoint": map[string]any{"id": breakpoint.ID, "verified": true, "line": breakpoint.ActualLine}})
+				source := map[string]any{"name": filepath.Base(breakpoint.Source), "path": breakpoint.Source}
+				s.trace("notifying IDE that breakpoint id=%d is verified at %s:%d", breakpoint.ID, breakpoint.Source, breakpoint.ActualLine)
+				_ = s.event("breakpoint", map[string]any{
+					"reason": "changed",
+					"breakpoint": map[string]any{
+						"id":       breakpoint.ID,
+						"verified": true,
+						"line":     breakpoint.ActualLine,
+						"source":   source,
+					},
+				})
 			}
 		}
 	}
@@ -1023,10 +1265,12 @@ func (s *server) handleBreakpointEvent(event jdwp.Event) {
 	}
 	s.bpMu.Unlock()
 	if breakpoint == nil {
+		s.trace("received unmatched JDWP breakpoint event request=%d thread=%d class=%d method=%d codeIndex=%d", event.RequestID, event.ThreadID, event.Location.ClassID, event.Location.MethodID, event.Location.Index)
 		s.setStopped(true)
 		s.event("stopped", map[string]any{"reason": "breakpoint", "threadId": event.ThreadID, "allThreadsStopped": event.Suspend == jdwp.SuspendAll})
 		return
 	}
+	s.trace("hit breakpoint id=%d request=%d source=%q line=%d thread=%d", current.ID, event.RequestID, current.Source, current.ActualLine, event.ThreadID)
 	stop, reason := hitConditionMatches(current.HitCondition, current.HitCount)
 	if reason != nil {
 		s.event("output", map[string]any{"category": "stderr", "output": reason.Error() + "\n"})
@@ -1083,7 +1327,11 @@ func (s *server) handleBreakpointEvent(event jdwp.Event) {
 		return
 	}
 	s.setStopped(true)
-	s.event("stopped", map[string]any{"reason": "breakpoint", "threadId": event.ThreadID, "allThreadsStopped": event.Suspend == jdwp.SuspendAll, "hitBreakpointIds": []int{current.ID}})
+	stopped := map[string]any{"reason": "breakpoint", "threadId": event.ThreadID, "allThreadsStopped": event.Suspend == jdwp.SuspendAll, "hitBreakpointIds": []int{current.ID}}
+	s.trace("sending stopped event for breakpoint id=%d thread=%d allThreadsStopped=%t", current.ID, event.ThreadID, event.Suspend == jdwp.SuspendAll)
+	if err := s.event("stopped", stopped); err != nil && s.logger != nil {
+		s.logger.Printf("DAP: could not send stopped event for breakpoint id=%d: %v", current.ID, err)
+	}
 }
 
 func hitConditionMatches(condition string, count int) (bool, error) {
@@ -1159,6 +1407,7 @@ func (s *server) step(req request) error {
 	if args.ThreadID == 0 {
 		return errors.New("step request requires threadId")
 	}
+	s.trace("IDE requested %s for thread=%d", req.Command, args.ThreadID)
 	if s.stepRequest != 0 {
 		_ = s.vm.ClearEvent(jdwp.EventSingleStep, s.stepRequest)
 	}
@@ -1171,17 +1420,24 @@ func (s *server) step(req request) error {
 	}
 	requestID, err := s.vm.SetStep(args.ThreadID, depth)
 	if err != nil {
+		s.trace("JDWP rejected %s for thread=%d: %v", req.Command, args.ThreadID, err)
 		return err
 	}
 	s.stepRequest = requestID
 	s.setStopped(false)
-	if err := s.vm.Resume(); err != nil {
-		return err
-	}
 	if err := s.response(req, true, map[string]any{"allThreadsContinued": true}); err != nil {
 		return err
 	}
-	return s.event("continued", map[string]any{"threadId": args.ThreadID, "allThreadsContinued": true})
+	if err := s.event("continued", map[string]any{"threadId": args.ThreadID, "allThreadsContinued": true}); err != nil {
+		return err
+	}
+	// Notify the DAP client before resuming the VM. Otherwise a fast step event
+	// can overtake this continued event, leaving the IDE in a running state.
+	if err := s.vm.Resume(); err != nil {
+		s.setStopped(true)
+		s.trace("could not resume JVM for %s: %v", req.Command, err)
+	}
+	return nil
 }
 
 func (s *server) setStopped(stopped bool) { s.runMu.Lock(); s.stopped = stopped; s.runMu.Unlock() }
@@ -1232,8 +1488,27 @@ func (s *server) response(req request, success bool, body any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.seq++
-	message := map[string]any{"seq": s.seq, "type": "response", "request_seq": req.Seq, "command": req.Command, "success": success}
-	if body != nil {
+	message := map[string]any{
+		"seq":         s.seq,
+		"type":        "response",
+		"request_seq": req.Seq,
+		"command":     req.Command,
+		"success":     success,
+	}
+	if !success {
+		errMsg := "request failed"
+		if bm, ok := body.(map[string]any); ok {
+			if e, ok := bm["error"].(string); ok && e != "" {
+				errMsg = e
+			}
+		}
+		message["message"] = errMsg
+		message["body"] = map[string]any{
+			"error": map[string]any{
+				"format": errMsg,
+			},
+		}
+	} else if body != nil {
 		message["body"] = body
 	}
 	return writeFrame(s.out, message)
@@ -1244,6 +1519,15 @@ func (s *server) event(name string, body any) error {
 	s.seq++
 	return writeFrame(s.out, map[string]any{"seq": s.seq, "type": "event", "event": name, "body": body})
 }
+
+func (s *server) trace(format string, args ...any) {
+	message := fmt.Sprintf(format, args...)
+	if s.logger != nil {
+		s.logger.Printf("DAP: %s", message)
+	}
+	_ = s.event("output", map[string]any{"category": "console", "output": "[java-debug-go] " + message + "\n"})
+}
+
 func (s *server) stop() {
 	if s.vm != nil {
 		_ = s.vm.Close()

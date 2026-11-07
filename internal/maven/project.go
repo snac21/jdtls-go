@@ -325,3 +325,43 @@ func mavenCommand(root string) (string, []string, error) {
 	}
 	return "", nil, errors.New("Maven 3.9 was not found: install Maven or add mvnw to the project")
 }
+
+func buildFallbackClasspath(moduleDir, scope string) (Classpath, error) {
+	pomPath := filepath.Join(moduleDir, "pom.xml")
+	pomData, err := os.ReadFile(pomPath)
+	if err != nil {
+		return Classpath{}, err
+	}
+	var pom POM
+	_ = xml.Unmarshal(pomData, &pom)
+	module := moduleFromPOM(moduleDir, pomPath, pom)
+
+	entries := []string{module.OutputDirectory}
+	if scope == "test" {
+		entries = append([]string{module.TestOutputDirectory}, entries...)
+	}
+
+	homeDir, _ := os.UserHomeDir()
+	localRepo := filepath.Join(homeDir, ".m2", "repository")
+
+	for _, dep := range pom.Dependencies {
+		if dep.Scope == "test" && scope != "test" {
+			continue
+		}
+		if dep.GroupID != "" && dep.ArtifactID != "" && dep.Version != "" {
+			groupPath := filepath.Join(strings.Split(dep.GroupID, ".")...)
+			jarName := fmt.Sprintf("%s-%s.jar", dep.ArtifactID, dep.Version)
+			jarPath := filepath.Join(localRepo, groupPath, dep.ArtifactID, dep.Version, jarName)
+			if _, statErr := os.Stat(jarPath); statErr == nil {
+				entries = append(entries, filepath.Clean(jarPath))
+			}
+		}
+	}
+
+	return Classpath{
+		Module:    moduleDir,
+		Entries:   entries,
+		Separator: string(os.PathListSeparator),
+		Warnings:  []string{"using pure-go fallback classpath"},
+	}, nil
+}

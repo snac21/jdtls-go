@@ -141,12 +141,16 @@ func Dial(address string) (*Connection, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err = c.Write([]byte(handshake)); err != nil {
+	return New(c)
+}
+
+func New(c net.Conn) (*Connection, error) {
+	if _, err := c.Write([]byte(handshake)); err != nil {
 		_ = c.Close()
 		return nil, err
 	}
 	answer := make([]byte, len(handshake))
-	if _, err = io.ReadFull(c, answer); err != nil {
+	if _, err := io.ReadFull(c, answer); err != nil {
 		_ = c.Close()
 		return nil, err
 	}
@@ -155,8 +159,17 @@ func Dial(address string) (*Connection, error) {
 		return nil, errors.New("invalid JDWP handshake")
 	}
 	conn := &Connection{
-		conn: c, nextID: 1, pending: map[uint32]chan commandResult{},
-		done: make(chan struct{}), events: make(chan Event, 4096),
+		conn:     c,
+		nextID:   1,
+		pending:  map[uint32]chan commandResult{},
+		done:     make(chan struct{}),
+		events:   make(chan Event, 4096),
+		fieldID:  8,
+		methodID: 8,
+		objectID: 8,
+		classID:  8,
+		frameID:  8,
+		threadID: 8,
 	}
 	go conn.readLoop()
 	data, err := conn.command(1, 7, nil) // VirtualMachine.IDSizes
@@ -168,12 +181,14 @@ func Dial(address string) (*Connection, error) {
 		_ = conn.Close()
 		return nil, errors.New("short JDWP IDSizes response")
 	}
+	conn.mu.Lock()
 	conn.fieldID = int(binary.BigEndian.Uint32(data[0:4]))
 	conn.methodID = int(binary.BigEndian.Uint32(data[4:8]))
 	conn.objectID = int(binary.BigEndian.Uint32(data[8:12]))
 	conn.classID = int(binary.BigEndian.Uint32(data[12:16]))
 	conn.frameID = int(binary.BigEndian.Uint32(data[16:20]))
 	conn.threadID = conn.objectID
+	conn.mu.Unlock()
 	return conn, nil
 }
 
@@ -271,6 +286,31 @@ func (c *Connection) decodeCompositeEvents(data []byte) ([]Event, error) {
 	if count < 0 || count > 100000 {
 		return nil, fmt.Errorf("invalid JDWP composite event count %d", count)
 	}
+
+	c.mu.Lock()
+	threadIDWidth := c.threadID
+	classIDWidth := c.classID
+	methodIDWidth := c.methodID
+	objectIDWidth := c.objectID
+	fieldIDWidth := c.fieldID
+	c.mu.Unlock()
+
+	if threadIDWidth < 1 {
+		threadIDWidth = 8
+	}
+	if classIDWidth < 1 {
+		classIDWidth = 8
+	}
+	if methodIDWidth < 1 {
+		methodIDWidth = 8
+	}
+	if objectIDWidth < 1 {
+		objectIDWidth = 8
+	}
+	if fieldIDWidth < 1 {
+		fieldIDWidth = 8
+	}
+
 	off := 5
 	out := make([]Event, 0, count)
 	for range count {
@@ -282,25 +322,25 @@ func (c *Connection) decodeCompositeEvents(data []byte) ([]Event, error) {
 		var err error
 		switch event.Kind {
 		case EventSingleStep, EventBreakpoint:
-			event.ThreadID, off, err = readID(data, off, c.threadID)
+			event.ThreadID, off, err = readID(data, off, threadIDWidth)
 			if err == nil {
-				event.Location, off, err = readLocation(data, off, c.classID, c.methodID)
+				event.Location, off, err = readLocation(data, off, classIDWidth, methodIDWidth)
 			}
 		case EventException:
-			event.ThreadID, off, err = readID(data, off, c.threadID)
+			event.ThreadID, off, err = readID(data, off, threadIDWidth)
 			if err == nil {
-				event.Location, off, err = readLocation(data, off, c.classID, c.methodID)
+				event.Location, off, err = readLocation(data, off, classIDWidth, methodIDWidth)
 			}
 			if err == nil {
-				event.Exception, off, err = readID(data, off, c.objectID)
+				event.Exception, off, err = readID(data, off, objectIDWidth)
 			}
 			if err == nil {
-				event.Catch, off, err = readLocation(data, off, c.classID, c.methodID)
+				event.Catch, off, err = readLocation(data, off, classIDWidth, methodIDWidth)
 			}
 		case EventAccessWatchpoint, EventModificationWatchpoint:
-			event.ThreadID, off, err = readID(data, off, c.threadID)
+			event.ThreadID, off, err = readID(data, off, threadIDWidth)
 			if err == nil {
-				event.Location, off, err = readLocation(data, off, c.classID, c.methodID)
+				event.Location, off, err = readLocation(data, off, classIDWidth, methodIDWidth)
 			}
 			if err == nil && off < len(data) {
 				var object Value
@@ -310,13 +350,13 @@ func (c *Connection) decodeCompositeEvents(data []byte) ([]Event, error) {
 				err = io.ErrUnexpectedEOF
 			}
 			if err == nil {
-				event.FieldID, off, err = readID(data, off, c.fieldID)
+				event.FieldID, off, err = readID(data, off, fieldIDWidth)
 			}
 			if err == nil && event.Kind == EventModificationWatchpoint {
 				_, off, err = c.readValue(data, off)
 			}
 		case EventClassPrepare:
-			event.ThreadID, off, err = readID(data, off, c.threadID)
+			event.ThreadID, off, err = readID(data, off, threadIDWidth)
 			if err == nil && off < len(data) {
 				event.TypeTag = data[off]
 				off++
@@ -324,7 +364,7 @@ func (c *Connection) decodeCompositeEvents(data []byte) ([]Event, error) {
 				err = io.ErrUnexpectedEOF
 			}
 			if err == nil {
-				event.TypeID, off, err = readID(data, off, c.classID)
+				event.TypeID, off, err = readID(data, off, classIDWidth)
 			}
 			if err == nil {
 				event.Signature, off, err = readString(data, off)
@@ -336,7 +376,11 @@ func (c *Connection) decodeCompositeEvents(data []byte) ([]Event, error) {
 				err = io.ErrUnexpectedEOF
 			}
 		case EventVMStart:
-			event.ThreadID, off, err = readID(data, off, c.threadID)
+			w := threadIDWidth
+			if off+4 == len(data) {
+				w = 4
+			}
+			event.ThreadID, off, err = readID(data, off, w)
 		case EventVMDeath:
 			// The event carries no additional payload.
 		default:
@@ -385,7 +429,10 @@ func (c *Connection) AllThreads() ([]Thread, error) {
 }
 
 func (c *Connection) Frames(thread uint64) ([]Frame, error) {
-	payload := append(encodeID(thread, c.threadID), make([]byte, 8)...)
+	// JDWP Frames expects startFrame and length as signed 32-bit integers;
+	// length=-1 requests every remaining frame. A zero length returns no frames.
+	payload := append(encodeID(thread, c.threadID), encodeUint32(0)...)
+	payload = append(payload, encodeUint32(^uint32(0))...)
 	data, err := c.command(11, 6, payload)
 	if err != nil {
 		return nil, err
@@ -498,7 +545,9 @@ func (c *Connection) SourceFile(classID uint64) (string, error) {
 }
 
 func (c *Connection) Methods(classID uint64) ([]Method, error) {
-	data, err := c.command(2, 5, encodeID(classID, c.classID))
+	// MethodsWithGeneric (ReferenceType command 15) includes the generic
+	// signature field parsed below. Plain Methods (command 5) does not.
+	data, err := c.command(2, 15, encodeID(classID, c.classID))
 	if err != nil {
 		return nil, err
 	}
@@ -570,15 +619,14 @@ func (c *Connection) Variables(classID, methodID uint64) ([]Variable, error) {
 	}
 	count := int(binary.BigEndian.Uint32(data[4:8]))
 	off := 8
-	if count > 100000 || off+count*4 > len(data) {
+	if count > 100000 || off+count*28 > len(data) {
 		return nil, fmt.Errorf("invalid local variable count %d", count)
 	}
 	out := make([]Variable, 0, count)
 	for range count {
 		variable := Variable{}
 		variable.CodeIndex = int64(binary.BigEndian.Uint64(data[off : off+8]))
-		variable.Length = int(binary.BigEndian.Uint32(data[off+8 : off+12]))
-		variable.Name, off, err = readString(data, off+12)
+		variable.Name, off, err = readString(data, off+8)
 		if err != nil {
 			return nil, err
 		}
@@ -587,9 +635,11 @@ func (c *Connection) Variables(classID, methodID uint64) ([]Variable, error) {
 			return nil, err
 		}
 		variable.Generic, off, err = readString(data, off)
-		if err != nil || off+4 > len(data) {
+		if err != nil || off+8 > len(data) {
 			return nil, io.ErrUnexpectedEOF
 		}
+		variable.Length = int(binary.BigEndian.Uint32(data[off : off+4]))
+		off += 4
 		variable.Slot = int(binary.BigEndian.Uint32(data[off : off+4]))
 		off += 4
 		out = append(out, variable)
@@ -634,7 +684,9 @@ func (c *Connection) SetFrameValue(threadID, frameID uint64, variable Variable, 
 }
 
 func (c *Connection) Fields(classID uint64) ([]Field, error) {
-	data, err := c.command(2, 4, encodeID(classID, c.classID))
+	// FieldsWithGeneric (ReferenceType command 14) includes the generic
+	// signature field consumed below. Plain Fields (command 4) does not.
+	data, err := c.command(2, 14, encodeID(classID, c.classID))
 	if err != nil {
 		return nil, err
 	}
@@ -864,7 +916,7 @@ func writeFull(writer io.Writer, data []byte) (int, error) {
 	return written, nil
 }
 
-const variableTableCommand byte = 2
+const variableTableCommand byte = 5
 
 func (c *Connection) SetClassPrepare(pattern string) (uint32, error) {
 	payload := []byte{EventClassPrepare, SuspendAll, 0, 0, 0, 1, 5}
@@ -894,7 +946,8 @@ func (c *Connection) SetFieldWatch(classTag byte, classID, fieldID uint64, acces
 func (c *Connection) SetStep(threadID uint64, depth byte) (uint32, error) {
 	payload := []byte{EventSingleStep, SuspendAll, 0, 0, 0, 1, 10}
 	payload = append(payload, encodeID(threadID, c.threadID)...)
-	payload = append(payload, 0, 1, depth) // line granularity, INTO/OVER/OUT
+	payload = append(payload, encodeUint32(1)...) // line granularity
+	payload = append(payload, encodeUint32(uint32(depth))...)
 	return c.setEvent(payload)
 }
 
@@ -1005,7 +1058,16 @@ func encodeInt64(value int64) []byte {
 }
 
 func readID(b []byte, off, width int) (uint64, int, error) {
-	if width < 1 || off+width > len(b) {
+	if width < 1 {
+		if off+8 <= len(b) {
+			width = 8
+		} else if off+4 <= len(b) {
+			width = 4
+		} else {
+			return 0, off, io.ErrUnexpectedEOF
+		}
+	}
+	if off+width > len(b) {
 		return 0, off, io.ErrUnexpectedEOF
 	}
 	var id uint64

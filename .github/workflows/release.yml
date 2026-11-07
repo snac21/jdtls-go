@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos-arm64:
+    name: Build macOS ARM64
+    runs-on: macos-15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.x"
+          cache: true
+
+      - name: Build binaries
+        run: make build-arm
+
+      - name: Package ZIP
+        run: |
+          zip -j jdtls-go-darwin-arm64.zip \
+            bin/jdtls-go-darwin-arm64 \
+            bin/java-debug-go-darwin-arm64
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: macos-arm64
+          path: jdtls-go-darwin-arm64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  build-windows-amd64:
+    name: Build Windows x86_64
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.x"
+          cache: true
+
+      - name: Install MinGW-w64 and zip
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-mingw-w64-x86-64 zip
+
+      - name: Build binaries
+        run: make build-win WINDOWS_CC=x86_64-w64-mingw32-gcc
+
+      - name: Package ZIP
+        run: |
+          zip -j jdtls-go-windows-amd64.zip \
+            bin/jdtls-go-windows-amd64.exe \
+            bin/java-debug-go-windows-amd64.exe
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-amd64
+          path: jdtls-go-windows-amd64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-24.04
+    needs:
+      - build-macos-arm64
+      - build-windows-amd64
+    permissions:
+      contents: write
+    steps:
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: macos-arm64
+          path: dist
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: windows-amd64
+          path: dist
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" dist/*.zip --clobber
+          else
+            gh release create "$TAG_NAME" dist/*.zip \
+              --title "$TAG_NAME" \
+              --generate-notes
+          fi

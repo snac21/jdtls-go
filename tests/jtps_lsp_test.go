@@ -221,7 +221,10 @@ func pathToURI(p string) string {
 func TestJtpsLSPReconstructionSuite(t *testing.T) {
 	jtpsRoot := findJtpsRoot(t)
 	helloControllerPath := filepath.Join(jtpsRoot, "src/main/java/com/example/jtps/HelloController.java")
-	appJavaPath := filepath.Join(jtpsRoot, "src/main/java/com/example/jtps/JtpsApplication.java")
+	appJavaPath := filepath.Join(jtpsRoot, "src/main/java/com/example/jtps/JdtlsApplication.java")
+	if _, err := os.Stat(appJavaPath); err != nil {
+		appJavaPath = filepath.Join(jtpsRoot, "src/main/java/com/example/jtps/JtpsApplication.java")
+	}
 	helloContentBytes, err := os.ReadFile(helloControllerPath)
 	if err != nil {
 		t.Fatalf("读取 HelloController.java 失败: %v", err)
@@ -1233,7 +1236,87 @@ func TestJtpsLSPReconstructionSuite(t *testing.T) {
 	})
 
 	// -------------------------------------------------------------
-	// 21. 测试优雅关闭 (shutdown & exit)
+	// 21. 测试方法定义与实现跳转 (对齐 Cannot find declaration to go to 缺陷)
+	// -------------------------------------------------------------
+	t.Run("LSP_Method_Definition_And_Implementation", func(t *testing.T) {
+		// HelloController.java 中的 hello 方法 (line 8, col 18: "public String hello()")
+		defParams := map[string]any{
+			"textDocument": map[string]any{"uri": helloURI},
+			"position":     map[string]int{"line": 8, "character": 19},
+		}
+		defRes, err := client.request(LSPMethodTextDocumentDefinition, defParams)
+		if err != nil {
+			t.Fatalf("textDocument/definition 失败: %v", err)
+		}
+		var defLocs []struct {
+			URI   string `json:"uri"`
+			Range struct {
+				Start struct {
+					Line      int `json:"line"`
+					Character int `json:"character"`
+				} `json:"start"`
+			} `json:"range"`
+		}
+		if err := json.Unmarshal(defRes, &defLocs); err != nil {
+			t.Fatalf("解析 definition 响应失败: %v", err)
+		}
+		if len(defLocs) == 0 {
+			t.Errorf("点击 hello 方法未返回任何定义位置")
+		}
+		t.Logf("hello 方法定义位置数量: %d, 响应: %s", len(defLocs), string(defRes))
+
+		// 测试方法实现跳转 (textDocument/implementation)
+		implRes, err := client.request(LSPMethodTextDocumentImplementation, defParams)
+		if err != nil {
+			t.Fatalf("textDocument/implementation 失败: %v", err)
+		}
+		var implLocs []any
+		if err := json.Unmarshal(implRes, &implLocs); err != nil {
+			t.Fatalf("解析 implementation 响应失败: %v", err)
+		}
+		if len(implLocs) == 0 {
+			t.Errorf("点击 hello 方法未返回任何实现位置")
+		}
+		t.Logf("hello 方法实现位置数量: %d, 响应: %s", len(implLocs), string(implRes))
+	})
+
+	// -------------------------------------------------------------
+	// 22. 测试 OpenIDEA 调试类路径解析 (vscode.java.resolveClasspath)
+	// -------------------------------------------------------------
+	t.Run("LSP_VSCode_ResolveClasspath_OpenIDEA", func(t *testing.T) {
+		// OpenIDEA 传参形式: [mainClass, projectName]
+		classes := []string{"com.example.jtps.JdtlsApplication", "com.example.jtps.JtpsApplication"}
+		for _, cls := range classes {
+			cpRes, err := client.request(LSPMethodWorkspaceExecuteCommand, map[string]any{
+				"command":   string(JDTCommandVSCodeResolveClasspath),
+				"arguments": []any{cls, "jtps"},
+			})
+			if err != nil {
+				t.Fatalf("vscode.java.resolveClasspath 对于类 %s 执行失败: %v", cls, err)
+			}
+			var entries []string
+			if err := json.Unmarshal(cpRes, &entries); err != nil {
+				t.Fatalf("vscode.java.resolveClasspath 未返回 []string 数组格式: %v, raw: %s", err, string(cpRes))
+			}
+			if len(entries) == 0 {
+				t.Fatalf("类路径解析结果为空切片")
+			}
+			foundClasses := false
+			for _, entry := range entries {
+				if strings.HasSuffix(filepath.ToSlash(entry), "target/classes") {
+					foundClasses = true
+					break
+				}
+			}
+			if !foundClasses {
+				t.Errorf("解析结果未包含 target/classes 目录: %+v", entries)
+			}
+			t.Logf("类 %s 成功解析类路径条目数: %d, 示例: %s", cls, len(entries), entries[0])
+		}
+	})
+
+	// -------------------------------------------------------------
+	// 23. 测试优雅关闭 (shutdown & exit)
 	// -------------------------------------------------------------
 	t.Run("LSP_Shutdown_And_Exit", func(t *testing.T) {
 		res, err := client.request(LSPMethodShutdown, nil)

@@ -58,8 +58,10 @@ func (s *server) stackTrace(req request) error {
 	}
 	frames, err := s.vm.Frames(args.ThreadID)
 	if err != nil {
+		s.trace("stackTrace failed for thread=%d: %v", args.ThreadID, err)
 		return err
 	}
+	s.trace("stackTrace thread=%d returned %d JDWP frames", args.ThreadID, len(frames))
 	start := max(args.Start, 0)
 	if start > len(frames) {
 		start = len(frames)
@@ -696,6 +698,7 @@ func (s *server) addHandle(handle variableHandle) int {
 func (s *server) localValues(frame frameRef) ([]localValue, error) {
 	variables, err := s.vm.Variables(frame.ClassID, frame.MethodID)
 	if err != nil {
+		s.trace("read local variable table failed class=%d method=%d: %v", frame.ClassID, frame.MethodID, err)
 		return nil, err
 	}
 	active := make([]jdwp.Variable, 0, len(variables))
@@ -704,8 +707,12 @@ func (s *server) localValues(frame frameRef) ([]localValue, error) {
 			active = append(active, variable)
 		}
 	}
+	if len(active) == 0 {
+		s.trace("no locals active at class=%d method=%d codeIndex=%d; table entries=%d", frame.ClassID, frame.MethodID, frame.CodeIndex, len(variables))
+	}
 	values, err := s.vm.FrameValues(frame.ThreadID, frame.FrameID, active)
 	if err != nil {
+		s.trace("read local values failed thread=%d frame=%d: %v", frame.ThreadID, frame.FrameID, err)
 		return nil, err
 	}
 	out := make([]localValue, 0, len(active))

@@ -2,10 +2,12 @@ package tests
 
 import (
 	"bufio"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cage/jdtls-go/internal/dap"
+	"github.com/cage/jdtls-go/internal/jdwp"
 )
 
 // dapClient 是用于 DAP 协议通信的轻量级测试客户端
@@ -168,6 +171,39 @@ func (c *dapClient) request(command DAPCommand, arguments any) (json.RawMessage,
 		return parsed.Body, nil
 	case <-time.After(5 * time.Second):
 		return nil, fmt.Errorf("timeout waiting for DAP response to %s (seq=%d)", command, seq)
+	}
+}
+
+func (c *dapClient) requestRaw(command DAPCommand, arguments any) ([]byte, error) {
+	c.mu.Lock()
+	c.nextSeq++
+	seq := c.nextSeq
+	ch := make(chan json.RawMessage, 1)
+	c.pending[seq] = ch
+	c.mu.Unlock()
+
+	reqMap := map[string]any{
+		"seq":       seq,
+		"type":      "request",
+		"command":   string(command),
+		"arguments": arguments,
+	}
+
+	body, err := json.Marshal(reqMap)
+	if err != nil {
+		return nil, err
+	}
+
+	frame := fmt.Sprintf("Content-Length: %d\r\n\r\n%s", len(body), string(body))
+	if _, err := c.toServer.Write([]byte(frame)); err != nil {
+		return nil, err
+	}
+
+	select {
+	case res := <-ch:
+		return res, nil
+	case <-time.After(5 * time.Second):
+		return nil, fmt.Errorf("timeout waiting for raw DAP response to %s (seq=%d)", command, seq)
 	}
 }
 
@@ -386,7 +422,48 @@ func TestJtpsDAPReconstructionSuite(t *testing.T) {
 	})
 
 	// -------------------------------------------------------------
-	// 7. DAP disconnect 优雅断开
+	// 7. 测试 DAP 错误契约规范 (解决 launch failed: request failed)
+	// -------------------------------------------------------------
+	t.Run("DAP_Error_Format_And_TopLevel_Message", func(t *testing.T) {
+		// 故意发送无 mainClass 的 launch 请求，触发校验错误
+		badLaunchArgs := map[string]any{
+			"name":    "TestError",
+			"request": "launch",
+		}
+		rawResp, err := client.requestRaw(DAPCommandLaunch, badLaunchArgs)
+		if err != nil {
+			t.Fatalf("发送 launch 请求失败: %v", err)
+		}
+
+		var resp struct {
+			Success bool   `json:"success"`
+			Command string `json:"command"`
+			Message string `json:"message"`
+			Body    struct {
+				Error struct {
+					Format string `json:"format"`
+				} `json:"error"`
+			} `json:"body"`
+		}
+		if err := json.Unmarshal(rawResp, &resp); err != nil {
+			t.Fatalf("解析 DAP 响应 JSON 失败: %v, raw: %s", err, string(rawResp))
+		}
+
+		if resp.Success {
+			t.Errorf("缺少 mainClass 时 launch 不应成功")
+		}
+		if resp.Message == "" || resp.Message == "request failed" {
+			t.Errorf("DAP 顶级 message 字段未正确填充，导致客户端 fallback 为 request failed: %q", resp.Message)
+		}
+		if resp.Body.Error.Format == "" {
+			t.Errorf("DAP body.error.format 字段为空，未能对齐 DAP 结构化错误契约")
+		}
+		t.Logf("成功校验 DAP 结构化错误响应: command=%s, success=%v, message=%s, body.error.format=%s",
+			resp.Command, resp.Success, resp.Message, resp.Body.Error.Format)
+	})
+
+	// -------------------------------------------------------------
+	// 8. DAP disconnect 优雅断开
 	// -------------------------------------------------------------
 	t.Run("DAP_Disconnect", func(t *testing.T) {
 		args := map[string]any{
@@ -398,4 +475,86 @@ func TestJtpsDAPReconstructionSuite(t *testing.T) {
 		}
 		t.Log("disconnect 执行成功")
 	})
+}
+
+// TestJDWPVMStartDecoding 专项测试 JDWP 握手初期并发到达 EventVMStart (kind 90) 的解码稳定性
+func TestJDWPVMStartDecoding(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	// 启动模拟 JVM JDWP Server
+	go func() {
+		// 1. 完成 JDWP 握手
+		handshake := make([]byte, 14)
+		if _, err := io.ReadFull(serverConn, handshake); err != nil {
+			return
+		}
+		if _, err := serverConn.Write(handshake); err != nil {
+			return
+		}
+
+		// 2. 模拟 JVM 立即主动推送 EventVMStart (kind 90) 事件包 (Set 64, Command 100)
+		// Composite Event 包结构:
+		// Header (11 bytes): Length(4) + ID(4) + Flags(1:0) + CommandSet(1:64) + Command(1:100)
+		// Body: SuspendPolicy(1:2) + EventCount(4:1) + EventKind(1:90) + RequestID(4:0) + ThreadID(8:1001)
+		// Body 长度 = 1 + 4 + 1 + 4 + 8 = 18 字节, 包总长 = 11 + 18 = 29 字节
+		vmStartPkt := make([]byte, 29)
+		binary.BigEndian.PutUint32(vmStartPkt[0:4], 29)
+		binary.BigEndian.PutUint32(vmStartPkt[4:8], 9999) // event packet id
+		vmStartPkt[8] = 0                                // command packet
+		vmStartPkt[9] = 64                               // Event command set
+		vmStartPkt[10] = 100                             // Composite command
+		// Body
+		vmStartPkt[11] = 2 // SuspendAll
+		binary.BigEndian.PutUint32(vmStartPkt[12:16], 1)
+		vmStartPkt[16] = 90 // EventVMStart
+		binary.BigEndian.PutUint32(vmStartPkt[17:21], 0)
+		binary.BigEndian.PutUint64(vmStartPkt[21:29], 1001) // ThreadID
+
+		_, _ = serverConn.Write(vmStartPkt)
+
+		// 3. 读取客户端发来的 VirtualMachine.IDSizes 请求包 (Set 1, Command 7)
+		reqHeader := make([]byte, 11)
+		if _, err := io.ReadFull(serverConn, reqHeader); err != nil {
+			return
+		}
+		reqID := binary.BigEndian.Uint32(reqHeader[4:8])
+
+		// 回复 IDSizes 响应包 (5 个 4 字节的 ID 大小声明，共 20 字节)
+		// fieldID(4) + methodID(4) + objectID(4) + classID(4) + frameID(4) = 8, 8, 8, 8, 8
+		respPkt := make([]byte, 11+20)
+		binary.BigEndian.PutUint32(respPkt[0:4], 31)
+		binary.BigEndian.PutUint32(respPkt[4:8], reqID)
+		respPkt[8] = 0x80 // reply packet
+		binary.BigEndian.PutUint16(respPkt[9:11], 0) // error code 0
+		binary.BigEndian.PutUint32(respPkt[11:15], 8) // fieldID
+		binary.BigEndian.PutUint32(respPkt[15:19], 8) // methodID
+		binary.BigEndian.PutUint32(respPkt[19:23], 8) // objectID
+		binary.BigEndian.PutUint32(respPkt[23:27], 8) // classID
+		binary.BigEndian.PutUint32(respPkt[27:31], 8) // frameID
+
+		_, _ = serverConn.Write(respPkt)
+	}()
+
+	// 客户端调用 jdwp.New
+	vm, err := jdwp.New(clientConn)
+	if err != nil {
+		t.Fatalf("jdwp.New 失败，出现握手/事件解码回归: %v", err)
+	}
+	defer vm.Close()
+
+	// 验证成功收到并解码 EventVMStart
+	select {
+	case event := <-vm.Events():
+		if event.Kind != 90 {
+			t.Errorf("期望收到 EventVMStart (kind 90)，实际为: %d", event.Kind)
+		}
+		if event.ThreadID != 1001 {
+			t.Errorf("期望 ThreadID 为 1001，实际为: %d", event.ThreadID)
+		}
+		t.Logf("成功解码 EventVMStart: Kind=%d, ThreadID=%d", event.Kind, event.ThreadID)
+	case <-time.After(3 * time.Second):
+		t.Fatalf("超时未收到 EventVMStart 事件")
+	}
 }
