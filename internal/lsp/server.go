@@ -21,6 +21,7 @@ import (
 	"unicode"
 
 	"github.com/cage/jdtls-go/internal/classfile"
+	"github.com/cage/jdtls-go/internal/fileuri"
 	javaparser "github.com/cage/jdtls-go/internal/java"
 	"github.com/cage/jdtls-go/internal/maven"
 	"github.com/cage/jdtls-go/internal/spring"
@@ -2534,8 +2535,8 @@ func isTypeSymbol(kind int) bool {
 	return kind == 5 || kind == 10 || kind == 11
 }
 func uriPath(uri string) string {
-	if parsed, err := url.Parse(uri); err == nil && parsed.Scheme == "file" {
-		return filepath.FromSlash(parsed.Path)
+	if path, ok := fileuri.FromURI(uri); ok {
+		return path
 	}
 	return uri
 }

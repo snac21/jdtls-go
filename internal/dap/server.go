@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cage/jdtls-go/internal/fileuri"
 	"github.com/cage/jdtls-go/internal/jdwp"
 	"github.com/cage/jdtls-go/internal/maven"
 )
@@ -1457,7 +1458,9 @@ func (s *server) currentException() jdwp.Event {
 func (s *server) isStopped() bool { s.runMu.Lock(); defer s.runMu.Unlock(); return s.stopped }
 
 func normalizeSourcePath(path string) string {
-	if strings.HasPrefix(path, "file://") {
+	if localPath, ok := fileuri.FromURI(path); ok {
+		path = localPath
+	} else if strings.HasPrefix(path, "file://") {
 		path = strings.TrimPrefix(path, "file://")
 	}
 	if absolute, err := filepath.Abs(path); err == nil {
