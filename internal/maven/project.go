@@ -309,7 +309,11 @@ func resolveClasspathWithPaths(ctx context.Context, root, moduleDir, scope strin
 }
 
 func mavenCommand(root string) (string, []string, error) {
-	wrapper := filepath.Join(root, "mvnw")
+	wrapperName := "mvnw"
+	if runtime.GOOS == "windows" {
+		wrapperName += ".cmd"
+	}
+	wrapper := filepath.Join(root, wrapperName)
 	if info, err := os.Stat(wrapper); err == nil && info.Mode().IsRegular() {
 		return wrapper, nil, nil
 	}

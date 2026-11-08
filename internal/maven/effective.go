@@ -250,6 +250,16 @@ func runMaven(ctx context.Context, root, moduleDir string, args ...string) (stri
 		return "", err
 	}
 	commandArgs := append(append([]string{}, baseArgs...), args...)
+	if runtime.GOOS == "windows" && (strings.EqualFold(filepath.Ext(program), ".cmd") || strings.EqualFold(filepath.Ext(program), ".bat")) {
+		// Windows batch files are shell scripts, not executables. Start them
+		// through cmd.exe so Maven home, PATH installs, and mvnw.cmd all work.
+		shell := os.Getenv("COMSPEC")
+		if shell == "" {
+			shell = "cmd.exe"
+		}
+		commandArgs = append([]string{"/d", "/c", program}, commandArgs...)
+		program = shell
+	}
 	cmd := exec.CommandContext(ctx, program, commandArgs...)
 	cmd.Dir = moduleDir
 	cmd.Env = os.Environ()
